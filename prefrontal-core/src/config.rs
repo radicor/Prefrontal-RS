@@ -70,6 +70,10 @@ pub struct CortexConfig {
     pub agent_id: String,
     /// Default result count for recall queries.
     pub top_k: u32,
+    /// Deadline for one cortex round trip. A cortex that accepts the request
+    /// and never answers must not wedge the caller (and, through it, the
+    /// whole optional subsystem) forever.
+    pub request_timeout_secs: u64,
 }
 
 impl Default for CortexConfig {
@@ -80,6 +84,7 @@ impl Default for CortexConfig {
             env: HashMap::new(),
             agent_id: "prefrontal".into(),
             top_k: 8,
+            request_timeout_secs: 30,
         }
     }
 }

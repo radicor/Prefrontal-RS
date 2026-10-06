@@ -39,11 +39,24 @@ pub struct Fields {
     /// 1-based declaration line — set on symbol documents only.
     pub line: Field,
 }
-
+/// Owns the index *and* its writer behind one lock.
+///
+/// A panic mid-`add_document` used to poison a `Mutex<IndexWriter>` that every
+/// later `.expect("index writer poisoned")` re-panicked on — after which
+/// search silently answered from a frozen index forever, with no signal
+/// anywhere. The charter already calls the index a rebuildable cache, so a
+/// poison is repaired by wiping and reopening it; `is_healthy` then tells the
+/// daemon it has an empty index to refill.
 pub struct SearchIndex {
-    pub index: Index,
-    pub writer: Mutex<IndexWriter>,
-    pub fields: Fields,
+    dir: PathBuf,
+    state: Mutex<State>,
+    healthy: std::sync::atomic::AtomicBool,
+}
+
+struct State {
+    index: Index,
+    writer: IndexWriter,
+    fields: Fields,
 }
 
 /// Default index home: `~/.local/share/prefrontal/index` — never inside projects.
@@ -79,7 +92,50 @@ pub fn open(dir: &Path) -> Result<SearchIndex> {
         }
     };
     let writer = index.writer(50_000_000)?;
-    Ok(SearchIndex { index, writer: Mutex::new(writer), fields })
+    Ok(SearchIndex {
+        dir: dir.to_path_buf(),
+        state: Mutex::new(State { index, writer, fields }),
+        healthy: std::sync::atomic::AtomicBool::new(true),
+    })
+}
+
+impl SearchIndex {
+    /// False once the writer has been recovered — the index is then empty and
+    /// the caller should reindex every project.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Run `f` against the index, repairing a poisoned writer first. A panic
+    /// inside `f` poisons us again and the next call repairs — the caller
+    /// sees the error, not a permanently broken subsystem.
+    fn with_state<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                self.reopen(&mut state)?;
+                state
+            }
+        };
+        f(&mut state)
+    }
+
+    /// Wipe and reopen. The index is derived data; keeping a half-written one
+    /// is worse than rebuilding it.
+    fn reopen(&self, state: &mut State) -> Result<()> {
+        // No logging in this crate — the daemon reports the rebuild.
+        std::fs::remove_dir_all(&self.dir).ok();
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("recreating {}", self.dir.display()))?;
+        let (sch, fields) = schema();
+        let index = Index::open_or_create(tantivy::directory::MmapDirectory::open(&self.dir)?, sch)?;
+        state.index = index;
+        state.writer = state.index.writer(50_000_000)?;
+        state.fields = fields;
+        self.healthy.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 /// Read-only open for the CLI; fails politely if the daemon never built one.
@@ -97,60 +153,78 @@ impl SearchIndex {
         walk_files(project_dir, project_dir, 0, &mut files);
         let commits = commit_log(project_dir);
 
-        let writer = self.writer.lock().expect("index writer poisoned");
-        writer.delete_term(Term::from_field_text(self.fields.project, name));
-        let mut added = 0usize;
-        for (rel, kind) in &files {
-            let Some(content) = read_indexable(&project_dir.join(rel)) else { continue };
-            if kind == "code" {
-                let ext = rel.rsplit('.').next().unwrap_or_default().to_lowercase();
-                for sym in symbols::extract(&ext, &content) {
-                    // tiny doc per declaration: a name query ranks it far above
-                    // the file it lives in, and the signature ships in-index
-                    writer.add_document(doc!(
-                        self.fields.project => name,
-                        self.fields.path => rel.as_str(),
-                        self.fields.kind => "symbol",
-                        self.fields.content => format!("{} {}", sym.kind, sym.name),
-                        self.fields.stored_text => sym.signature,
-                        self.fields.line => sym.line as u64,
-                    ))?;
-                    added += 1;
+        self.with_state(|state| {
+            let fields = state.fields;
+            state
+                .writer
+                .delete_term(Term::from_field_text(fields.project, name));
+            let mut added = 0usize;
+            for (rel, kind) in &files {
+                let Some(content) = read_indexable(&project_dir.join(rel)) else { continue };
+                if kind == "code" {
+                    let ext = rel.rsplit('.').next().unwrap_or_default().to_lowercase();
+                    for sym in symbols::extract(&ext, &content) {
+                        // tiny doc per declaration: a name query ranks it far above
+                        // the file it lives in, and the signature ships in-index
+                        state.writer.add_document(doc!(
+                            fields.project => name,
+                            fields.path => rel.as_str(),
+                            fields.kind => "symbol",
+                            fields.content => format!("{} {}", sym.kind, sym.name),
+                            fields.stored_text => sym.signature,
+                            fields.line => sym.line as u64,
+                        ))?;
+                        added += 1;
+                    }
                 }
+                state.writer.add_document(doc!(
+                    fields.project => name,
+                    fields.path => rel.as_str(),
+                    fields.kind => kind.as_str(),
+                    fields.content => content,
+                ))?;
+                added += 1;
             }
-            writer.add_document(doc!(
-                self.fields.project => name,
-                self.fields.path => rel.as_str(),
-                self.fields.kind => kind.as_str(),
-                self.fields.content => content,
-            ))?;
-            added += 1;
-        }
-        for (id, summary) in &commits {
-            writer.add_document(doc!(
-                self.fields.project => name,
-                self.fields.path => id.as_str(),
-                self.fields.kind => "commit",
-                self.fields.content => summary.as_str(),
-                self.fields.stored_text => summary.as_str(),
-            ))?;
-            added += 1;
-        }
-        drop(writer);
-        self.commit()?;
-        Ok(added)
+            for (id, summary) in &commits {
+                state.writer.add_document(doc!(
+                    fields.project => name,
+                    fields.path => id.as_str(),
+                    fields.kind => "commit",
+                    fields.content => summary.as_str(),
+                    fields.stored_text => summary.as_str(),
+                ))?;
+                added += 1;
+            }
+            state.writer.commit()?;
+            Ok(added)
+        })
     }
 
     pub fn remove_project(&self, name: &str) -> Result<()> {
-        let writer = self.writer.lock().expect("index writer poisoned");
-        writer.delete_term(Term::from_field_text(self.fields.project, name));
-        drop(writer);
-        self.commit()
+        self.with_state(|state| {
+            state
+                .writer
+                .delete_term(Term::from_field_text(state.fields.project, name));
+            state.writer.commit()?;
+            Ok(())
+        })
     }
 
-    fn commit(&self) -> Result<()> {
-        self.writer.lock().expect("index writer poisoned").commit()?;
-        Ok(())
+    /// Query the index. Enriches hits with snippets from disk, so the hit
+    /// list stays honest about what is on the filesystem right now.
+    pub fn search_hits(
+        &self,
+        query: &str,
+        limit: usize,
+        project_dirs: &HashMap<String, PathBuf>,
+    ) -> Result<Vec<SearchHit>> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        search(&state.index, state.fields, query, limit, project_dirs)
+    }
+
+    /// The index has been refilled after a rebuild.
+    pub fn mark_healthy(&self) {
+        self.healthy.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

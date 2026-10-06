@@ -11,7 +11,53 @@ dashboard does, your code can do too. Four ways in:
 | `prefrontal mcp` | MCP stdio | AI agents |
 
 All types below live in the `prefrontal-protocol` crate — every surface
-serializes/deserializes the same structs. The daemon binds loopback only.
+serializes/deserializes the same structs.
+
+---
+
+## The origin boundary — read this before binding anywhere but loopback
+
+The daemon has **no authentication**. Its whole security posture is "the
+caller is the local user", which stops being true the moment a web page is
+open, so the daemon re-establishes it per request:
+
+| Check | Rule |
+|---|---|
+| `Host` | Must be the configured bind address (plus `localhost`/`::1`/`0.0.0.0`). Anything else is `403`. Kills DNS rebinding. |
+| `Sec-Fetch-Site` | On `POST`/`PUT`/`PATCH`/`DELETE` must be `same-origin` or `none`. `cross-site`/`same-site` is `403`. |
+| `Origin` | When `Sec-Fetch-Site` is absent, `Origin` must equal `http://<the request's own Host>`. A missing `Origin` is allowed — that is the CLI, MCP, and `curl`. |
+| `GET /ws` | Same `Origin` rule. Browsers do not enforce same-origin on a WebSocket handshake, so without it any page could read the whole `Snapshot`. |
+
+Every response carries `Content-Security-Policy` (`default-src 'self'`,
+`script-src 'self'`, `object-src 'none'`, `frame-ancestors 'none'`),
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+`X-Frame-Options: DENY`, and `Cross-Origin-Resource-Policy: same-origin`.
+
+**`[server] bind` widens all of this.** The defaults are tuned for
+`127.0.0.1`. On any other interface the daemon is an *unauthenticated*
+read/write service for every project under your roots — including
+`POST /api/git/<project>/commit` — reachable by anyone who can route to it.
+If you need that, put it behind something that authenticates.
+
+### Untrusted project directories
+
+A project folder here may have been copied, synced, restored from a backup, or
+unpacked from a tarball, and in every one of those cases its `.git/config`
+came from someone else. Every `git` shell-out therefore passes hardening
+`-c` overrides that outrank all config files: `core.fsmonitor`,
+`core.attributesFile` and `credential.helper` are blanked, `core.sshCommand`
+is pinned to `ssh`, `core.pager` to `cat`, and `core.hooksPath` is pinned to
+the repository's own hooks directory. Without this, a `core.fsmonitor` line
+turns opening the Repo tab into arbitrary command execution. Note commits
+still use your identity, your global config, and your local hooks.
+
+Rendered markdown is *sanitized*, not escaped: comrak with
+`render.r#unsafe = true` piped through `ammonia::clean`, so a README's
+`<div>`/`<img>` survive and its `<script>` does not. `/raw` (which serves
+images a README references, `svg` included) returns
+`Content-Disposition: attachment` plus `Content-Security-Policy: sandbox`
+so a hostile SVG can never execute at the dashboard's origin — `<img>`
+renders it fine.
 
 ---
 
@@ -49,8 +95,40 @@ watcher keeps it current; no scan happens per request).
 
 ### `POST /api/rescan` → `Project[]`
 
-Full rescan now; also broadcasts a fresh `snapshot` to every WS client.
+Full rescan now; also broadcasts a merged `snapshot` to every WS client.
 The escape hatch — normally the watcher makes this unnecessary.
+
+Three deliberate behaviours:
+
+- **A failed scan keeps the last good state.** A panic anywhere in the scan
+  answers `500` and leaves the cached project list alone; it never blanks the
+  dashboard.
+- **Results merge, they do not replace.** A project the watcher touched while
+  the walk was running keeps its newer data, so a commit made mid-rescan does
+  not disappear from the counts until the next filesystem event.
+- **Throttled and de-duplicated.** A scan started less than 5 s after the
+  last one, or while one is still running, returns the current list without
+  starting another walk. Two overlapping scans can never resolve out of
+  order.
+
+### `GET /api/health` → daemon health
+
+The "is it actually live?" answer the connection dot could not give.
+`watch.failed_dirs > 0` means some directories are not being watched at all
+(inotify limits) and those projects are static until a rescan;
+`index_ok: false` means the search index was rebuilt and is being refilled.
+The dashboard shows both in its footer.
+
+```jsonc
+{
+  "ok": true,
+  "projects": 47,
+  "watch": { "watched_dirs": 4312, "failed_dirs": 0 },
+  "index_ok": true,
+  "last_scan": { "last_scan_unix": 1785340000, "last_scan_failed": false,
+                 "watched_dirs": 4312, "failed_dirs": 0 }
+}
+```
 
 ### `GET /api/colony` → `ColonyStatus`
 

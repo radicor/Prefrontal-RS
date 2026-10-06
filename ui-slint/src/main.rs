@@ -235,7 +235,7 @@ fn stamp(unix: i64) -> String {
 
 async fn open_project(weak: Weak<MainWindow>, name: String) {
     let docs: Vec<prefrontal_protocol::DocEntry> =
-        fetch_json(&format!("{BASE}/api/docs/{name}")).await.unwrap_or_default();
+        fetch_json(&format!("{BASE}/api/docs/{}", urlencode(&name))).await.unwrap_or_default();
     let first = docs.first().map(|d| d.path.clone());
     let items: Vec<DocItem> = docs
         .into_iter()

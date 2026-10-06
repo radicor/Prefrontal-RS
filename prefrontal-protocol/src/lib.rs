@@ -100,7 +100,9 @@ pub struct DocContent {
     pub project: String,
     pub path: String,
     pub raw: String,
-    /// comrak output with raw HTML escaped — safe to inject as innerHTML.
+    /// comrak output piped through `ammonia::clean` — *sanitized*, not
+    /// escaped: raw HTML is preserved and only active markup is stripped.
+    /// Treat it as untrusted and keep it behind the daemon's CSP.
     pub html: String,
     pub modified_unix: i64,
 }
@@ -326,7 +328,6 @@ pub enum GitTreeKind {
 pub struct GitTreeEntry {
     pub path: String,
     pub kind: GitTreeKind,
-    pub size: Option<u64>,
 }
 
 /// A file at a revision (or `WORKTREE` for the on-disk path).

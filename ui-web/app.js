@@ -91,8 +91,9 @@ function renderHealth(list) {
   const rows = document.getElementById("health-list");
   rows.replaceChildren();
   for (const p of flagged) {
-    const row = el("div", "health-row");
-    row.title = `open ${p.name}`;
+    const row = el("button", "health-row");
+    row.type = "button";
+    row.dataset.open = p.name;
     row.onclick = () => openPanel(p.name, { tab: "repo" });
     row.append(el("span", "name", p.name));
     for (const f of p.health) {
@@ -147,7 +148,9 @@ function renderTimeline(list) {
       block.append(el("div", "tl-proj", e.project));
       dayEl.append(block);
     }
-    const row = el("div", "tl-commit");
+    const row = el("button", "tl-commit");
+    row.type = "button";
+    row.dataset.open = e.project;
     const time = new Date(e.time_unix * 1000).toLocaleTimeString(undefined, {
       hour: "2-digit",
       minute: "2-digit",
@@ -240,8 +243,10 @@ function renderColony() {
 }
 
 function card(p) {
-  const c = el("article", "card" + (p.activity === "archived" ? " archived" : ""));
+  const c = el("button", "card" + (p.activity === "archived" ? " archived" : ""));
+  c.type = "button";
   c.title = `open docs & notes for ${p.name}`;
+  c.dataset.open = p.name;
   c.onclick = () => openPanel(p.name);
 
   const head = el("div", "head");
@@ -281,6 +286,13 @@ function card(p) {
 
 let searchTimer = null;
 let searchSeq = 0;
+let cortexSeq = 0;
+
+// Both panels answer the same debounced query; a slow reply from one must not
+// paint over the other's newer results.
+function isCurrent(seq) {
+  return seq === searchSeq && seq === cortexSeq;
+}
 
 let cortexAvailable = true; // flips off on the first 503 so we stop asking
 
@@ -299,6 +311,7 @@ function scheduleSearch() {
 }
 
 async function runCortex(q) {
+  const seq = ++cortexSeq;
   const section = document.getElementById("cortex-results");
   if (!cortexAvailable) return;
   try {
@@ -312,6 +325,7 @@ async function runCortex(q) {
       return;
     }
     const hits = await res.json();
+    if (!isCurrent(seq)) return; // a newer query is in flight
     section.hidden = hits.length === 0;
     document.getElementById("cortex-count").textContent = hits.length ? `(${hits.length})` : "";
     const list = document.getElementById("cortex-list");
@@ -335,7 +349,7 @@ async function runSearch(q) {
   const seq = ++searchSeq;
   try {
     const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
-    if (!res.ok || seq !== searchSeq) return; // stale response — a newer query is in flight
+    if (!res.ok || !isCurrent(seq)) return; // stale response — a newer query is in flight
     renderHits(await res.json());
   } catch {
     /* daemon gone; the conn dot already says so */
@@ -352,7 +366,12 @@ function renderHits(hits) {
     const isDoc = h.kind === "doc";
     const isCommit = h.kind === "commit";
     const isCode = h.kind === "code" || h.kind === "symbol";
-    const row = el("div", "hit" + (isDoc || isCommit || isCode ? " openable" : ""));
+    const openable = isDoc || isCommit || isCode;
+    const row = el(openable ? "button" : "div", "hit" + (openable ? " openable" : ""));
+    if (openable) {
+      row.type = "button";
+      row.dataset.open = h.project;
+    }
     const top = el("div", "top");
     const loc =
       h.kind === "commit" ? `commit ${h.path}` : h.line ? `${h.path}:${h.line}` : h.path;
@@ -380,6 +399,8 @@ function renderHits(hits) {
 const panel = {
   project: null,
   docs: [],
+  docsError: null,
+  opener: null, // the element focus returns to when the panel closes
   openPath: null,
   raw: "",
   mode: "view", // view | edit | create
@@ -440,6 +461,12 @@ function setTab(tab) {
 }
 
 async function openPanel(projectName, opts = {}) {
+  // Keyed, not element-keyed: the card grid re-renders on every WS delta, so
+  // the node that opened the panel is often gone by the time it closes.
+  if ($("overlay").hidden) {
+    panel.opener = document.activeElement;
+    panel.openerKey = document.activeElement?.dataset?.open ?? null;
+  }
   const prev = panel.project;
   panel.project = projectName;
   panel.openPath = null;
@@ -462,15 +489,30 @@ async function openPanel(projectName, opts = {}) {
   status("");
   setMode("view");
   $("overlay").hidden = false;
+  // The dialog asserts modality; move focus into it so the keyboard is here
+  // rather than back in the card grid behind the scrim.
+  $("tab-notes").focus();
+  panel.docsError = null;
   try {
     const res = await fetch(`/api/docs/${enc(projectName)}`);
-    panel.docs = res.ok ? await res.json() : [];
+    if (res.ok) {
+      panel.docs = await res.json();
+    } else {
+      panel.docs = [];
+      panel.docsError = await res.text();
+    }
   } catch {
     panel.docs = [];
+    panel.docsError = "daemon unreachable";
   }
   renderDocList();
   if (panel.docs.length) {
     openDoc(panel.docs[0].path); // README sorts first server-side
+  } else if (panel.docsError) {
+    $("doc-view").replaceChildren(
+      el("div", "empty", `couldn't list docs — ${panel.docsError}`),
+      retryButton(() => openPanel(projectName, opts))
+    );
   } else {
     $("doc-view").replaceChildren(el("div", "empty", "no docs here yet — start one with ＋ note"));
   }
@@ -480,11 +522,19 @@ async function openPanel(projectName, opts = {}) {
   setTab(wantRepo ? "repo" : "notes");
 }
 
+/// A failed load must not look like an empty one — say so, and offer the retry.
+function retryButton(onRetry) {
+  const b = el("button", "retry", "retry");
+  b.type = "button";
+  b.onclick = onRetry;
+  return b;
+}
+
 function renderDocList() {
   const list = $("doc-list");
   list.replaceChildren();
   if (!panel.docs.length) {
-    list.append(el("div", "none", "no docs"));
+    list.append(el("div", "none", panel.docsError ? "docs unavailable" : "no docs"));
     return;
   }
   for (const d of panel.docs) {
@@ -499,8 +549,11 @@ function renderDocList() {
   }
 }
 
-// Resolve doc-relative references: images go through /raw, sibling docs
-// navigate inside the panel, external links open a fresh tab.
+// Resolve doc-relative references: images and other files go through /raw,
+// sibling docs navigate inside the panel, external links open a fresh tab.
+// Anything relative that used to be left alone resolved against the dashboard
+// root and 404'd into the UI's own ServeDir, which is never what the author
+// meant.
 function fixupDocLinks(container, project, docPath) {
   const dir = docPath.includes("/") ? docPath.slice(0, docPath.lastIndexOf("/") + 1) : "";
   const isExternal = (u) => /^([a-z][a-z0-9+.-]*:)?\/\//i.test(u) || u.startsWith("data:") || u.startsWith("/");
@@ -533,6 +586,14 @@ function fixupDocLinks(container, project, docPath) {
         e.preventDefault();
         openDoc(target);
       };
+    } else {
+      // A relative link to a non-doc file. /raw serves the image extensions a
+      // README actually references and refuses the rest with a reason, which
+      // beats a silent 404 from the dashboard root.
+      a.href = rawUrl(href.split("#")[0]);
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.title = `${a.getAttribute("title") ?? a.textContent} — served from the project`;
     }
   }
 }
@@ -547,14 +608,19 @@ async function openDoc(path) {
     );
     if (seq !== docSeq) return; // a newer openDoc superseded this one
     if (!res.ok) {
-      status(await res.text(), "warn");
+      const why = await res.text();
+      status(why, "warn");
+      $("doc-view").replaceChildren(
+        el("div", "empty", `couldn't read ${path} — ${why}`),
+        retryButton(() => openDoc(path))
+      );
       return;
     }
     const doc = await res.json();
     panel.openPath = doc.path;
     panel.raw = doc.raw;
     $("panel-path").textContent = doc.path;
-    $("doc-view").innerHTML = doc.html; // comrak output, raw HTML escaped server-side
+    $("doc-view").innerHTML = doc.html; // comrak output, ammonia-sanitized server-side
     fixupDocLinks($("doc-view"), panel.project, doc.path);
     $("doc-view").scrollTop = 0;
     status("");
@@ -565,13 +631,18 @@ async function openDoc(path) {
   }
 }
 
+let saving = false;
+
 async function saveDoc() {
+  if (saving) return; // a double-click would PUT twice and auto-commit twice
   const path = panel.mode === "create" ? $("doc-filename").value.trim() : panel.openPath;
   if (!path) {
     status("give the note a filename", "warn");
     return;
   }
   const content = $("doc-editor").value;
+  saving = true;
+  $("btn-save").disabled = true;
   status("saving…");
   try {
     const res = await fetch(
@@ -589,18 +660,33 @@ async function saveDoc() {
       status(`saved · not committed${r.detail ? ` — ${r.detail}` : ""}`, "warn");
     }
     if (panel.mode === "create" && !panel.docs.some((d) => d.path === path)) {
-      panel.docs.push({ path, size: content.length, modified_unix: Date.now() / 1000 });
+      // the server reports bytes; content.length would count UTF-16 units
+      panel.docs.push({
+        path,
+        size: new TextEncoder().encode(content).length,
+        modified_unix: Date.now() / 1000,
+      });
       panel.docs.sort((a, b) => (a.path !== "README.md") - (b.path !== "README.md") || a.path.localeCompare(b.path));
     }
     openDoc(path);
   } catch {
     status("save failed — daemon unreachable", "warn");
+  } finally {
+    saving = false;
+    $("btn-save").disabled = false;
   }
 }
 
 function closePanel() {
   $("overlay").hidden = true;
   panel.project = null;
+  // Modality means focus has to come back out to where it came from.
+  const target = panel.openerKey
+    ? document.querySelector(`[data-open="${CSS.escape(panel.openerKey)}"]`)
+    : panel.opener;
+  if (target && document.contains(target)) target.focus();
+  panel.opener = null;
+  panel.openerKey = null;
 }
 
 let repoSeq = 0;
@@ -723,18 +809,22 @@ function renderStatusList() {
     list.append(el("div", "repo-h", `${title} (${rows.length})`));
     for (const e of rows) {
       const mark = entryMark(e);
+      const staged = e.index !== "none" && e.worktree === "none";
+      // Two sibling buttons, not a button with a nested control: nesting an
+      // interactive element inside another is invalid, and the stage action
+      // was previously a <span onclick> that no keyboard could reach.
+      const entry = el("div", "repo-entry");
       const row = el("button", "repo-row" + (panel.selPath === e.path && !panel.selCommit ? " sel" : ""));
       row.type = "button";
       row.append(el("span", `mark ${mark.cls}`, mark.t), el("span", "nm", e.path));
       row.title = e.path;
-      row.onclick = () => openDiff(e.path, e.index !== "none" && e.worktree === "none");
-      const act = el("span", "act", e.index !== "none" && e.worktree === "none" ? "unstage" : "stage");
-      act.onclick = (ev) => {
-        ev.stopPropagation();
-        gitOp(e.index !== "none" && e.worktree === "none" ? "unstage" : "stage", { paths: [e.path] });
-      };
-      row.append(act);
-      list.append(row);
+      row.onclick = () => openDiff(e.path, staged);
+      const act = el("button", "act", staged ? "unstage" : "stage");
+      act.type = "button";
+      act.title = `${staged ? "unstage" : "stage"} ${e.path}`;
+      act.onclick = () => gitOp(staged ? "unstage" : "stage", { paths: [e.path] }, act);
+      entry.append(row, act);
+      list.append(entry);
     }
   }
   if ((panel.git?.stashes ?? []).length) {
@@ -885,10 +975,31 @@ async function openRepoFile(path, rev) {
   }
 }
 
-async function gitOp(verb, body) {
+// Git porcelain is not idempotent and the server has no per-project ordering,
+// so the client owns the serialization: one queue per project, one op at a
+// time. Clicking "commit" while "stage" is still in flight used to land a
+// commit without the file the user just staged.
+const gitQueue = new Map(); // project -> tail of its chain
+
+function gitOp(verb, body, trigger) {
+  const project = panel.project;
+  const prev = gitQueue.get(project) ?? Promise.resolve();
+  const run = prev.then(() => runGitOp(project, verb, body, trigger));
+  const tail = run.catch(() => {});
+  gitQueue.set(project, tail);
+  // drop the key once this op is the last one queued, so the map stays
+  // proportional to in-flight work rather than to the garden size
+  tail.then(() => {
+    if (gitQueue.get(project) === tail) gitQueue.delete(project);
+  });
+  return run;
+}
+
+async function runGitOp(project, verb, body, trigger) {
+  if (trigger) trigger.disabled = true;
   status(`${verb}…`);
   try {
-    const res = await fetch(`/api/git/${enc(panel.project)}/${verb}`, {
+    const res = await fetch(`/api/git/${enc(project)}/${verb}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body ?? {}),
@@ -903,6 +1014,8 @@ async function gitOp(verb, body) {
     await loadRepo();
   } catch {
     status(`${verb} failed — daemon unreachable`, "warn");
+  } finally {
+    if (trigger) trigger.disabled = false;
   }
 }
 
@@ -940,24 +1053,45 @@ function bindPanel() {
     panel.repoMode = "files";
     setTab("repo");
   };
-  $("btn-repo-commit").onclick = () => {
-    const message = $("repo-msg").value;
-    gitOp("commit", { message });
-  };
-  $("btn-repo-stash").onclick = () => {
+  $("btn-repo-commit").onclick = (e) =>
+    gitOp("commit", { message: $("repo-msg").value }, e.currentTarget);
+  $("btn-repo-stash").onclick = (e) => {
     const message = $("repo-msg").value.trim();
-    gitOp("stash", { action: "push", message: message || null });
+    gitOp("stash", { action: "push", message: message || null }, e.currentTarget);
   };
-  $("btn-repo-push").onclick = () => gitOp("push", {});
-  $("btn-repo-fetch").onclick = () => gitOp("fetch", {});
+  $("btn-repo-push").onclick = (e) => gitOp("push", {}, e.currentTarget);
+  $("btn-repo-fetch").onclick = (e) => gitOp("fetch", {}, e.currentTarget);
   document.addEventListener("keydown", (e) => {
     if ($("overlay").hidden) return;
     if (e.key === "Escape") closePanel();
+    if (e.key === "Tab") trapTab(e);
     if ((e.ctrlKey || e.metaKey) && e.key === "s" && panel.mode !== "view" && panel.tab === "notes") {
       e.preventDefault();
       saveDoc();
     }
   });
+}
+
+/// `aria-modal` is only true if Tab stays inside. Without this, Tab walks
+/// straight out of the panel into the card grid behind the scrim.
+function trapTab(e) {
+  const focusable = $("overlay").querySelectorAll(
+    'button:not([disabled]), a[href], input, textarea, select, [tabindex]:not([tabindex="-1"])'
+  );
+  const visible = [...focusable].filter((n) => n.offsetParent !== null || n === document.activeElement);
+  if (!visible.length) return;
+  const first = visible[0];
+  const last = visible[visible.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  } else if (!$("overlay").contains(document.activeElement)) {
+    e.preventDefault();
+    first.focus();
+  }
 }
 
 function render() {
@@ -1041,7 +1175,15 @@ function connectWS() {
     setConn(true);
     wsRetryMs = 1000;
   };
-  ws.onmessage = (m) => handleEvent(JSON.parse(m.data));
+  ws.onmessage = (m) => {
+    let ev;
+    try {
+      ev = JSON.parse(m.data);
+    } catch {
+      return; // one malformed frame must not kill the rest of the stream
+    }
+    if (ev && typeof ev.type === "string") handleEvent(ev);
+  };
   ws.onclose = () => {
     setConn(false);
     scheduleReconnect(); // fresh snapshot on reconnect covers anything missed
@@ -1084,6 +1226,30 @@ async function boot() {
       colony = await res.json();
       renderColony();
     } // 503 = panel disabled — stays hidden, like cortex
+  } catch {
+    /* daemon gone; the conn dot already says so */
+  }
+  loadHealth();
+}
+
+/// The connection dot says "can I talk to the daemon". It never said whether
+/// the daemon can still *see* the disk — a watcher that lost directories to
+/// the inotify limit looks exactly like a live one.
+async function loadHealth() {
+  const note = document.getElementById("foot-note");
+  const base = "Prefrontal-RS · phase 7: working tree · 127.0.0.1 only";
+  try {
+    const res = await fetch("/api/health");
+    if (!res.ok) return;
+    const h = await res.json();
+    const parts = [base];
+    if (h.watch?.failed_dirs) {
+      parts.push(`live for ${h.watch.watched_dirs} of ${h.watch.watched_dirs + h.watch.failed_dirs} projects — ${h.watch.failed_dirs} unwatched (inotify limit?)`);
+    }
+    if (h.index_ok === false) parts.push("search index rebuilding");
+    if (h.last_scan?.last_scan_failed) parts.push("last rescan failed — showing the last good state");
+    note.textContent = parts.join(" · ");
+    if (h.watch?.failed_dirs || h.index_ok === false) note.classList.add("warn");
   } catch {
     /* daemon gone; the conn dot already says so */
   }

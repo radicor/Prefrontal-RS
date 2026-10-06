@@ -5,7 +5,9 @@
 //! instead of — the lexical index.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use prefrontal_protocol::{CortexHit, Project};
@@ -16,7 +18,11 @@ use crate::config::CortexConfig;
 pub struct CortexClient {
     child: Child,
     stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    /// Lines from a reader thread that owns the child's stdout. A blocking
+    /// `read_line` has no deadline, so a cortex that takes the request and
+    /// never answers would pin this thread — and the caller's mutex with it —
+    /// for the life of the process.
+    lines: mpsc::Receiver<String>,
     next_id: u64,
     cfg: CortexConfig,
 }
@@ -43,10 +49,28 @@ impl CortexClient {
             .with_context(|| format!("spawning {}", cfg.command))?;
         let stdin = child.stdin.take().context("cortex stdin")?;
         let stdout = child.stdout.take().context("cortex stdout")?;
+        let (tx, lines) = mpsc::channel();
+        // Ends when the pipe closes: killing the child in `Drop` unblocks the
+        // read, and dropping `tx` is how EOF reaches `recv_timeout`.
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(std::mem::take(&mut line)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         let mut client = Self {
             child,
             stdin,
-            reader: BufReader::new(stdout),
+            lines,
             next_id: 0,
             cfg: cfg.clone(),
         };
@@ -68,12 +92,14 @@ impl CortexClient {
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         writeln!(self.stdin, "{msg}")?;
         self.stdin.flush()?;
-        let mut line = String::new();
+        let timeout = Duration::from_secs(self.cfg.request_timeout_secs.clamp(1, 600));
         loop {
-            line.clear();
-            if self.reader.read_line(&mut line)? == 0 {
-                bail!("cortex closed the pipe");
-            }
+            let line = self.lines.recv_timeout(timeout).map_err(|e| match e {
+                RecvTimeoutError::Timeout => {
+                    anyhow::anyhow!("cortex did not answer {method} within {}s", timeout.as_secs())
+                }
+                RecvTimeoutError::Disconnected => anyhow::anyhow!("cortex closed the pipe"),
+            })?;
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
             if v.get("id").and_then(|i| i.as_u64()) != Some(id) {
                 continue; // stray notification or log line
@@ -84,6 +110,7 @@ impl CortexClient {
             return Ok(v.get("result").cloned().unwrap_or(Value::Null));
         }
     }
+
 
     /// tools/call returning the text payload; tool-level isError becomes Err.
     fn call(&mut self, tool: &str, arguments: Value) -> Result<String> {

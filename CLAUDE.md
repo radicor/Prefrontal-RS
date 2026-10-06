@@ -21,7 +21,23 @@ rendering), `prefrontal-cli` (humans + `mcp` stdio server for agents),
 
 ## Invariants — break these and you've broken the product
 
-- **Localhost only.** Nothing ever binds beyond 127.0.0.1; no telemetry.
+- **Loopback is not a boundary on its own.** The daemon has no auth, so
+  `origin_guard` (in `prefrontald/src/main.rs`) re-establishes "the caller is
+  the local user" per request: `Host` must be the configured bind, and every
+  mutating request plus `/ws` must be `Sec-Fetch-Site: same-origin|none` or
+  carry an `Origin` matching our own authority. Every response gets a CSP,
+  `nosniff`, and friends. A new route is inside this boundary automatically —
+  do not add one outside the router.
+- **Project directories are untrusted.** Anything under the roots may have
+  been copied or unpacked from somewhere else, `.git/config` included. Every
+  `git` shell-out goes through `core::git::git_cmd`, which neutralizes
+  `core.fsmonitor`, `core.attributesFile`, `credential.helper`,
+  `core.sshCommand`, `core.pager` and pins `core.hooksPath`. Use it; a bare
+  `Command::new("git")` reintroduces remote code execution.
+- **Never replace live state with a failed scan.** `rescan` merges by
+  freshness and keeps the previous list on a panic; `SearchIndex` rebuilds
+  itself when the writer is poisoned. `.expect` on a poisoned index or
+  `unwrap_or_default()` on a scan is how the dashboard used to go blank.
 - **Path inputs are hostile.** Doc paths go through `docs::resolve_rel_path`
   (relative, no `..`, extension allow-listed, symlink-escape checked). Git
   pathspecs go through `git::resolve_repo_rel` / `validate_repo_rel` — same
@@ -38,10 +54,17 @@ rendering), `prefrontal-cli` (humans + `mcp` stdio server for agents),
   per-project dotfiles, ever (D5).
 - **Cortex is optional** (D6): `features.cerebro` off ⇒ every cortex path is
   dark and lexical search never notices. `/api/cortex` 503s, UI goes quiet.
-- **Rendered HTML is sanitized**: comrak with `render.r#unsafe = true` piped
-  through `ammonia::clean` — banners/img/div survive, scripts and handlers
-  must not. The dashboard origin can write files; a hostile README must never
-  execute in it.
+- **Rendered HTML is sanitized, not escaped** — the distinction matters.
+  comrak with `render.r#unsafe = true` piped through `ammonia::clean`:
+  banners/img/div survive, scripts and handlers must not. Never write
+  "escaped" in a comment here; a future maintainer who believes `innerHTML`
+  is inert by construction will weaken the one step standing between a cloned
+  README and the dashboard's write access.
+- **The UI is keyboard-operable.** Cards, health rows, timeline entries and
+  search hits are real `<button>`s; the project dialog is named
+  (`aria-labelledby`), traps Tab, takes focus on open and gives it back on
+  close. Interactive elements never nest. `ui-web/app.js` builds everything
+  with `el()`/`textContent` — keep it that way.
 - **Pure Rust, no C linking** (D7): gix not libgit2, regex symbols not
   tree-sitter, comrak not a JS renderer. Sanctioned `git` shell-outs: note
   commits, complete status (`porcelain=v2`), unified diffs, and the
@@ -58,7 +81,10 @@ rendering), `prefrontal-cli` (humans + `mcp` stdio server for agents),
   shared skip list (watcher + docs walk + indexer + repo tree).
 - `core/git.rs` — phase 7 working tree. Reads: gix log/refs/tree/blob +
   `git status --porcelain=v2` / `git diff` (dated exception). Writes: allowlisted
-  `git -C` only. CLI/MCP are **reads only**.
+  `git -C` only, always via `git_cmd` (see the untrusted-repo invariant).
+  CLI/MCP are reads only **except** `write_doc`, which writes one markdown
+  file and auto-commits it locally — deliberate, but it means an agent can
+  land a commit in any project under the roots.
 - `prefrontald/watch.rs` — per-directory watches (NEVER blanket-recursive:
   `target/` would eat inotify), `.git` watched surgically (dir non-recursive
   + `refs/` recursive → commits/branch-switches register without object-store

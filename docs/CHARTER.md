@@ -45,8 +45,8 @@ and expose the same brain to agents via MCP + CLI.
 | D3 | **Web frontend is the daily driver**; Slint frontend is a later, ApexOS-native port | Main use is on the laptop via browser. Rich markdown editing is web-territory. |
 | D4 | **Slint frontend is text-only where it must be** | No markdown widget in Slint; dashboard/browse/read is its wheelhouse, editing stays web-side. We compromise in Slint, never in web. |
 | D5 | **Central config**, not per-project dotfiles | One file owned by the dashboard (`~/.config/prefrontal/config.toml`). Projects stay unpolluted; works on repos you don't own. |
-| D6 | **CerebroCortex-RS integration is optional and feature-flagged** (`features.cerebro`, default off) | Must be useful to people without a Cerebro on their system if this goes public. Core search (tantivy + tree-sitter) has zero Cerebro dependency. |
-| D7 | **Pure-Rust backend** (`gix`, not libgit2; tantivy; tree-sitter) | ApexOS ethos: one toolchain, no C library linking pain. |
+| D6 | **CerebroCortex-RS integration is optional and feature-flagged** (`features.cerebro`, default off) | Must be useful to people without a Cerebro on their system if this goes public. Core search (tantivy + regex symbols) has zero Cerebro dependency. |
+| D7 | **Pure-Rust backend** (`gix`, not libgit2; tantivy; regex symbols — not tree-sitter, whose C runtime is exactly the linking pattern D7 avoids; see the 2026-07-29 amendment) | ApexOS ethos: one toolchain, no C library linking pain. |
 | D8 | **Zero config to first paint** | Point it at a root (default `~/Projects`), get a dashboard. Overrides are opt-in polish. |
 | D9 | **The dash commits notes itself** — local commit always (`[prefrontal]` prefix), never push. Human **Push** in the Repo tab is explicit-per-click, never `--force`, gated by `[git] allow_push` (default off) | Idea-capture must not depend on remembering to commit. Auto-commits never leave the machine. Network is a separate, opt-in verb. |
 
@@ -56,7 +56,7 @@ and expose the same brain to agents via MCP + CLI.
 ┌─────────────────────────────────────────────────────────┐
 │ prefrontald                                             │
 │  scanner ── git (gix) ── watcher (notify)               │
-│  index (tantivy) ── symbols (tree-sitter)               │
+│  index (tantivy) ── symbols (regex)                   │
 │  notes engine (md + auto-commit)                        │
 │  working tree (gix reads + allowlisted git porcelain)   │
 │  [feature: cerebro] ── CerebroCortex-RS client          │
@@ -94,7 +94,7 @@ Everything below is computed, never hand-maintained:
 |-------|-------|-----------|
 | **1. Pulse** | Scanner, health flags, activity states, web dashboard with card grid + health panel + "where was I" timeline (cross-project recent commits). WS live updates via file watcher. | Opening `localhost:7320` after a week AFK answers "where was I" in one screen. |
 | **2. Notes** | Markdown render (view any md in any project), edit + create notes, auto-commit with `[prefrontal]` prefix. `plan_drafts/` and `docs/` become first-class citizens. | Idea captured in the dash lands as a local commit without touching a terminal. |
-| **3. Recall** | tantivy full-text over code/docs/commit messages; tree-sitter symbol index (`fn`/`struct`/`class` cards across all projects). Incremental via watcher. | "resampler" finds `fn resample_audio` in a project you forgot existed, in <1s. |
+| **3. Recall** | tantivy full-text over code/docs/commit messages; regex symbol index (`fn`/`struct`/`class` cards across all projects). Incremental via watcher. | "resampler" finds `fn resample_audio` in a project you forgot existed, in <1s. |
 | **4. Agents** | MCP stdio server in the CLI: `project_list`, `project_status`, `where_was_i`, `search_code`, `find_symbol`, `read_doc`, `write_doc`. | A Claude session answers "do we already have X?" from Prefrontal instead of grepping. |
 | **5. Slint** | `ui-slint` over the same WS protocol: dashboard, browse, read (text-rendered md). No editing. | Runs on a pure ApexOS setup with no browser. |
 | **6. Cortex** *(optional, feature-flag)* | Ingest project summaries + docs into CerebroCortex-RS; semantic "that thing where I…" queries alongside lexical search. | Vague memory queries beat grep. |

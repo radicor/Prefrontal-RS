@@ -2,7 +2,6 @@
 //! a captured idea always lands as a local commit; push is never our business).
 
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context, Result};
@@ -103,6 +102,12 @@ fn resolve_rel_path(
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).context("creating parent directories")?;
         }
+        // A dangling symlink fails `exists()` below, so only the *parent* would
+        // be canonicalized and the write would land wherever it points. Refuse
+        // the symlink outright rather than resolving it.
+        if std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_symlink()) {
+            bail!("refusing to write through a symlink");
+        }
     }
     // canonicalize the existing part so a symlinked dir can't escape the root
     let canon_root = project_dir.canonicalize().context("project root")?;
@@ -149,11 +154,10 @@ pub fn write_doc(project_dir: &Path, rel: &str, content: &str) -> Result<DocWrit
     }
 
     let git = |args: &[&str]| {
-        Command::new("git")
-            .arg("-C")
-            .arg(project_dir)
+        crate::git::git_cmd(project_dir)
             .args(args)
             .output()
+            .context("running git")
     };
 
     let add = git(&["add", "--", rel])?;

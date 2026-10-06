@@ -12,7 +12,7 @@
 [![rust](https://img.shields.io/badge/100%25-Rust-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![local](https://img.shields.io/badge/127.0.0.1-only-22c55e?style=for-the-badge)]()
 [![license](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
-[![mcp](https://img.shields.io/badge/agents-MCP_·_7_tools-8b5cf6?style=for-the-badge)](docs/API.md#mcp--prefrontal-mcp)
+[![mcp](https://img.shields.io/badge/agents-MCP_·_14_tools-8b5cf6?style=for-the-badge)](docs/API.md#mcp--prefrontal-mcp)
 
 </div>
 
@@ -118,11 +118,18 @@ prefrontal recall "that vr thing"   # semantic (optional cortex layer)
 claude mcp add prefrontal -- /path/to/prefrontal mcp
 ```
 
-Eight tools — `list_projects`, `project_status`, `where_was_i`, `search`,
-`list_docs`, `read_doc`, `write_doc`, `colony_status` — daemon-independent,
-so agents get answers even when nothing else is running. Your agent checks
-whether the function exists before writing it a second time, and checks
-whether a sibling service is up before assuming either way.
+Fourteen tools — `list_projects`, `project_status`, `where_was_i`, `search`,
+`list_docs`, `read_doc`, `write_doc`, `colony_status`, `git_status`,
+`git_diff`, `git_log`, `git_show`, `git_tree`, `git_file` —
+daemon-independent, so agents get answers even when nothing else is
+running. Your agent checks whether the function exists before writing it a
+second time, and checks whether a sibling service is up before assuming
+either way.
+
+Everything except `write_doc` is read-only. `write_doc` writes one markdown
+file and auto-commits it locally with a `[prefrontal]` prefix — that is the
+point of the tool, but it means an agent can land a commit in any project
+under your roots. Nothing is ever pushed.
 
 For harnesses that support **Agent Skills**, ship the included skill so
 smaller models know *how* to use the tools, not just that they exist:

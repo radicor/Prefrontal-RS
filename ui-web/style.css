@@ -31,6 +31,10 @@
   --lang-node:       #199e70;
   --lang-python:     #3987e5;
   --lang-godot:      #9085e9;
+
+  /* badge text: near-white on the saturated fills in dark mode, dark ink in
+     light mode where near-white was down to 1.73:1 */
+  --badge-ink:       #ffffff;
 }
 
 @media (prefers-color-scheme: light) {
@@ -40,18 +44,67 @@
     --surface:       #fcfcfb;
     --ink:           #0b0b0b;
     --ink-2:         #52514e;
-    --muted:         #898781;
+    /* Light mode needs its own muted: #898781 on #fcfcfb is 3.38:1, under the
+       4.5:1 bar for the 11–12px text it carries. */
+    --muted:         #5f5e59;
     --hairline:      #e1e0d9;
     --border:        rgba(11, 11, 11, 0.10);
-    --act-active:    #2a78d6;
-    --act-warm:      #86b6ef;
-    --act-cold:      #898781;
-    --act-parked:    #b5b3ac;
-    --lang-rust:     #eb6834;
-    --lang-node:     #1baf7a;
-    --lang-python:   #2a78d6;
+    /* --act-warm is unreadable as text on white (2.02:1); darken for light. */
+    --act-warm:      #2b5f9e;
+    --act-active:    #1c5fbf;
+    --act-cold:      #5f5e59;
+    --act-parked:    #8b8983;
+    --lang-rust:     #b8410f;
+    --lang-node:     #0d7a55;
+    --lang-python:   #1c5fbf;
     --lang-godot:    #4a3aa7;
+    /* Badges put near-white text on saturated fills in dark mode; light mode
+       needs dark text (warning was 1.73:1 before this). */
+    --badge-ink:     #0b0b0b;
+    /* The saturated status fills are badge *backgrounds*; as text on white
+       they run 2–3:1. These are their light-mode text counterparts. */
+    --warning-text:  #6f4a00;
+    --serious-text:  #9c3f10;
+    --critical-text: #a82424;
+    --good-text:     #14650f;
   }
+  /* the critical fill is dark enough that dark ink on it still fails (4.1:1) */
+  .badge.critical { color: #ffffff; }
+  .git-line .dirty,
+  .panel-status .warn,
+  .repo-row .mark.unstaged { color: var(--warning-text); }
+  .panel-status .ok,
+  .repo-row .mark.staged { color: var(--good-text); }
+  .repo-row .mark.conflict { color: var(--critical-text); }
+  .tile.alert .v { color: var(--serious-text); }
+  .repo-banner { color: var(--warning-text); }
+  .foot.warn { color: var(--warning-text); }
+}
+
+/* ---------- shared control baseline ----------
+   Cards, rows and hits are real <button>s so they are reachable by keyboard
+   and announce as controls; these resets keep them looking identical. */
+button {
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+/* One visible focus indicator everywhere (SC 2.4.7). */
+:where(button, a, input, textarea, select, summary):focus-visible {
+  outline: 2px solid var(--act-active);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.vh {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 * { box-sizing: border-box; margin: 0; }
@@ -138,7 +191,11 @@ body {
   padding-left: 14px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.hit.openable { cursor: pointer; border-radius: 6px; padding: 2px 6px; margin: -2px -6px; }
+.hit.openable {
+  cursor: pointer; border-radius: 6px; padding: 2px 6px; margin: -2px -6px;
+  width: calc(100% + 12px);
+  background: none; border: none; color: inherit; display: block;
+}
 .hit.openable:hover { background: var(--hairline); }
 
 /* ---------- health panel ---------- */
@@ -167,9 +224,12 @@ body {
 }
 .health-row {
   display: flex; align-items: baseline; gap: 10px;
-  font-size: 13px;
+  font-size: 13px; width: 100%;
+  background: none; border: none; color: inherit;
+  padding: 2px 4px; border-radius: 6px;
 }
-.health-row .name { font-weight: 600; min-width: 180px; }
+.health-row:hover { background: var(--hairline); }
+.health-row .name { font-weight: 600; min-width: 180px; overflow-wrap: anywhere; }
 
 /* ---------- where-was-I timeline ---------- */
 .timeline {
@@ -203,7 +263,11 @@ body {
   margin: 0 0 8px 4px;
 }
 .tl-block .tl-proj { font-weight: 650; font-size: 13px; }
-.tl-commit { display: flex; gap: 10px; align-items: baseline; font-size: 12.5px; }
+.tl-commit {
+  display: flex; gap: 10px; align-items: baseline; font-size: 12.5px;
+  width: 100%; background: none; border: none; color: inherit;
+  padding: 1px 4px; border-radius: 6px;
+}
 .tl-commit .t { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .tl-commit .msg { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -234,7 +298,7 @@ body {
   flex-shrink: 0; align-self: center;
 }
 .col-row .dot.hollow { border: 1px solid var(--muted); }
-.col-row .name { font-weight: 600; min-width: 150px; }
+.col-row .name { font-weight: 600; min-width: 150px; overflow-wrap: anywhere; }
 .col-row .state {
   color: var(--ink-2); font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.5px;
@@ -291,7 +355,7 @@ body {
 }
 .card.archived { opacity: 0.65; }
 .card .head { display: flex; align-items: baseline; gap: 8px; }
-.card .name { font-weight: 650; font-size: 15px; }
+.card .name { font-weight: 650; font-size: 15px; overflow-wrap: anywhere; }
 .card .ago { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
 .card .tagline {
   color: var(--ink-2); font-size: 12.5px;
@@ -314,7 +378,7 @@ body {
   border-radius: 4px;
   padding: 1px 7px;
   font-size: 11.5px; font-weight: 600;
-  color: var(--page);
+  color: var(--badge-ink);
 }
 .badge.warning  { background: var(--st-warning); }
 .badge.serious  { background: var(--st-serious); }
@@ -328,7 +392,7 @@ body {
 .empty { color: var(--muted); padding: 30px 0; text-align: center; }
 
 /* ---------- project panel (docs & notes) ---------- */
-.card { cursor: pointer; }
+.card { cursor: pointer; width: 100%; }
 .card:hover { border-color: var(--act-active); }
 
 .overlay[hidden] { display: none; }
@@ -496,8 +560,17 @@ body {
 .repo-row .nm {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.repo-row .act { margin-left: auto; color: var(--muted); font-size: 11px; }
-.repo-row .act:hover { color: var(--ink); }
+/* stage/unstage is a sibling button, not a span inside the row button */
+.repo-entry { display: flex; align-items: center; gap: 2px; }
+.repo-entry > .repo-row { flex: 1; min-width: 0; }
+.repo-entry > .act {
+  flex-shrink: 0;
+  background: none; border: 1px solid transparent; border-radius: 6px;
+  color: var(--muted); font: inherit; font-size: 11px;
+  padding: 2px 7px; cursor: pointer;
+}
+.repo-entry > .act:hover:not(:disabled) { color: var(--ink); border-color: var(--border); }
+.repo-entry > .act:disabled { opacity: 0.45; cursor: progress; }
 .repo-ab { color: var(--muted); font-size: 12px; padding: 0 6px 6px; }
 .repo-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .source, .diff {
@@ -540,7 +613,7 @@ body {
 .repo-commit-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
 #btn-repo-commit { border-color: var(--st-good); color: var(--ink); }
 .health-row, .tl-commit, .hit.openable { cursor: pointer; }
-.health-row:hover, .tl-commit:hover { background: var(--hairline); }
+.health-row:hover, .tl-commit:hover, .hit.openable:hover { background: var(--hairline); }
 .git-line .ab { color: var(--ink-2); }
 
 @media (max-width: 700px) {
@@ -591,3 +664,31 @@ body {
 .md img { max-width: 100%; }
 .md hr { border: none; border-top: 1px solid var(--hairline); margin: 1.2em 0; }
 .md input[type="checkbox"] { margin-right: 6px; }
+
+/* Tasklist boxes are glyphs, not checkboxes: ammonia strips <input>. */
+.md li > span:first-child { margin-right: 4px; }
+
+/* ---------- retry affordance for failed loads ---------- */
+.retry {
+  display: block;
+  margin: 0 auto 30px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--ink-2);
+  font: inherit; font-size: 12.5px;
+  padding: 4px 14px;
+  cursor: pointer;
+  text-align: center;
+}
+.retry:hover { border-color: var(--act-active); color: var(--ink); }
+
+.foot.warn { color: var(--st-warning); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

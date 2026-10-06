@@ -203,9 +203,7 @@ fn git_info(dir: &Path, cfg: &Config) -> Option<GitInfo> {
 /// `git rev-list --left-right --count @{upstream}...HEAD` → (ahead, behind).
 /// One spawn; fails closed (no upstream) as `(None, None)`.
 fn ahead_behind(dir: &Path) -> (Option<u32>, Option<u32>) {
-    let Ok(out) = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    let Ok(out) = crate::git::git_cmd(dir)
         .args(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"])
         .output()
     else {

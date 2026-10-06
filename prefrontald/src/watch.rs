@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use prefrontal_core::{is_ignored, scan_project, SKIP_DIRS};
 use prefrontal_protocol::Event as WireEvent;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::AppState;
 
@@ -28,6 +28,31 @@ const MAX_DEPTH: u32 = 8;
 struct Raw {
     path: PathBuf,
     created_dir: bool,
+}
+
+/// Watcher coverage. A `watch()` that fails (inotify limits, permissions)
+/// used to be swallowed with `.is_ok()`, so a project silently stopped
+/// updating and the dashboard still claimed to be live.
+#[derive(Debug, Default)]
+pub struct Stats {
+    watched: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+}
+
+impl Stats {
+    pub fn watched(&self) -> u64 {
+        self.watched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn failed(&self) -> u64 {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn record(&self, ok: bool) {
+        let counter = if ok { &self.watched } else { &self.failed };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !ok {
+            warn!("watch() failed — this directory will not update live");
+        }
+    }
 }
 
 pub fn spawn(state: Arc<AppState>) -> Result<()> {
@@ -43,34 +68,43 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
     })?;
 
     let roots = state.cfg.root_paths();
-    let mut watches = 0usize;
     for root in &roots {
-        watcher.watch(root, RecursiveMode::NonRecursive)?;
-        watches += 1;
+        let result = watcher.watch(root, RecursiveMode::NonRecursive);
+        state.watcher.record(result.is_ok());
+        result.with_context(|| format!("watching root {}", root.display()))?;
         let Ok(entries) = std::fs::read_dir(root) else { continue };
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().to_string();
             if !entry.path().is_dir() || is_ignored(&name, &state.cfg) {
                 continue;
             }
-            watches += add_watches(&mut watcher, &entry.path(), 0);
+            add_watches(&mut watcher, &entry.path(), 0, &state.watcher);
         }
     }
-    info!("watching {watches} directories under {} root(s)", roots.len());
+    let watched = state.watcher.watched();
+    let failed = state.watcher.failed();
+    if failed > 0 {
+        warn!(
+            "watching {watched} directories under {} root(s) — {failed} could NOT be watched \
+             (inotify limit? see /proc/sys/fs/inotify/max_user_watches): those projects are static \
+             until a rescan",
+            roots.len()
+        );
+    } else {
+        info!("watching {watched} directories under {} root(s)", roots.len());
+    }
+
 
     tokio::spawn(debounce_loop(state, rx, watcher, roots));
     Ok(())
 }
 
-fn add_watches(w: &mut RecommendedWatcher, dir: &Path, depth: u32) -> usize {
+fn add_watches(w: &mut RecommendedWatcher, dir: &Path, depth: u32, stats: &Stats) {
     if depth > MAX_DEPTH {
-        return 0;
+        return;
     }
-    let mut n = 0;
-    if w.watch(dir, RecursiveMode::NonRecursive).is_ok() {
-        n += 1;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else { return n };
+    stats.record(w.watch(dir, RecursiveMode::NonRecursive).is_ok());
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.filter_map(|e| e.ok()) {
         let Ok(ft) = entry.file_type() else { continue };
         if !ft.is_dir() || ft.is_symlink() {
@@ -79,21 +113,18 @@ fn add_watches(w: &mut RecommendedWatcher, dir: &Path, depth: u32) -> usize {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if name == ".git" {
-            if w.watch(&path, RecursiveMode::NonRecursive).is_ok() {
-                n += 1;
-            }
+            stats.record(w.watch(&path, RecursiveMode::NonRecursive).is_ok());
             let refs = path.join("refs");
-            if refs.is_dir() && w.watch(&refs, RecursiveMode::Recursive).is_ok() {
-                n += 1;
+            if refs.is_dir() {
+                stats.record(w.watch(&refs, RecursiveMode::Recursive).is_ok());
             }
             continue;
         }
         if name.starts_with('.') || SKIP_DIRS.contains(&name.as_str()) {
             continue;
         }
-        n += add_watches(w, &path, depth + 1);
+        add_watches(w, &path, depth + 1, stats);
     }
-    n
 }
 
 /// Map an event path to the project directory (root's immediate child) it lives in.
@@ -126,7 +157,7 @@ async fn debounce_loop(
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
-                        add_watches(&mut watcher, &raw.path, 0);
+                        add_watches(&mut watcher, &raw.path, 0, &state.watcher);
                     }
                 }
                 if let Some(proj) = project_of(&raw.path, &roots) {
@@ -184,11 +215,19 @@ async fn rescan_one(state: &Arc<AppState>, dir: PathBuf) {
             if let Some(search) = state.search.clone() {
                 let name = project.name.clone();
                 let pdir = dir.clone();
+                let unhealthy = !search.is_healthy();
+                if unhealthy {
+                    // A repaired writer means an empty index; one project's
+                    // reindex would leave the other 46 unsearchable.
+                    warn!("index was rebuilt — refilling every project");
+                    tokio::spawn(crate::build_index(state.clone()));
+                }
                 tokio::task::spawn_blocking(move || {
                     if let Err(e) = search.reindex_project(&name, &pdir) {
                         debug!("reindex {name} failed: {e:#}");
                     }
                 });
+                crate::publish_index_health(state);
             }
             let _ = state.tx.send(WireEvent::ProjectChanged { project: Box::new(project) });
         }

@@ -22,6 +22,7 @@
   </section>
 
   <section class="controls">
+    <label class="vh" for="filter">Filter projects and search code, docs &amp; commits</label>
     <input id="filter" type="search" placeholder="filter cards · search code, docs & commits everywhere…"
            autocomplete="off" spellcheck="false">
   </section>
@@ -68,7 +69,7 @@
   </main>
 
   <div class="overlay" id="overlay" hidden>
-    <div class="panel" role="dialog" aria-modal="true">
+    <div class="panel" role="dialog" aria-modal="true" aria-labelledby="panel-title">
       <header class="panel-head">
         <span class="panel-title" id="panel-title"></span>
         <nav class="panel-tabs" aria-label="project surface">
@@ -87,9 +88,11 @@
       <div class="panel-body" id="notes-body">
         <nav class="doc-list" id="doc-list"></nav>
         <div class="doc-main">
+          <label class="vh" for="doc-filename">New note filename, relative to the project</label>
           <input id="doc-filename" class="doc-filename" hidden
                  autocomplete="off" spellcheck="false" placeholder="notes/my-idea.md">
           <div class="doc-view md" id="doc-view"></div>
+          <label class="vh" for="doc-editor">Note content</label>
           <textarea id="doc-editor" class="doc-editor" hidden
                     spellcheck="false" placeholder="capture it before it evaporates…"></textarea>
         </div>
@@ -111,6 +114,7 @@
       </div>
       <footer class="panel-foot">
         <div class="repo-commit-bar" id="repo-commit-bar" hidden>
+          <label class="vh" for="repo-msg">Commit message</label>
           <textarea id="repo-msg" class="repo-msg" rows="2" spellcheck="false"
                     placeholder="commit message"></textarea>
           <div class="repo-commit-actions">
@@ -120,7 +124,7 @@
             <button type="button" id="btn-repo-push" disabled title="enable [git] allow_push">push</button>
           </div>
         </div>
-        <div class="panel-status" id="panel-status"></div>
+        <div class="panel-status" id="panel-status" role="status" aria-live="polite"></div>
       </footer>
     </div>
   </div>

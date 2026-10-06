@@ -40,6 +40,7 @@ pub fn resolve_repo_rel(project_dir: &Path, rel: &str) -> Result<PathBuf> {
     let canon = if full.exists() {
         full.canonicalize()?
     } else {
+
         let parent = full.parent().context("no parent")?;
         let parent = if parent.exists() {
             parent.canonicalize()?
@@ -61,6 +62,44 @@ pub fn resolve_repo_rel(project_dir: &Path, rel: &str) -> Result<PathBuf> {
     Ok(canon)
 }
 
+/// A `git` invocation with the untrusted-config vectors neutralized.
+///
+/// A project directory here may have been copied, synced, restored from a
+/// backup or unpacked from a tarball, and in every one of those cases its
+/// `.git/config` came from someone else. `core.fsmonitor` alone turns
+/// `git status` — which runs on every Repo-tab open, with no gate in front of
+/// it — into arbitrary code execution as the user. Command-line config
+/// outranks *every* config file (repo, global, system), so the keys below
+/// cannot be re-enabled from disk.
+///
+/// Deliberately not done: `GIT_CONFIG_NOSYSTEM`. Note commits need the user's
+/// `[user]` identity, and `-c` already covers every key that executes code.
+/// `core.hooksPath` is pinned to the repository's own hooks directory rather
+/// than blanked, so ordinary local hooks keep running while a redirect into
+/// an attacker-shipped directory does not.
+pub fn git_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir);
+    for key in ["core.fsmonitor", "core.attributesFile", "credential.helper"] {
+        cmd.arg("-c").arg(format!("{key}="));
+    }
+    for (key, value) in [("core.sshCommand", "ssh"), ("core.pager", "cat")] {
+        cmd.arg("-c").arg(format!("{key}={value}"));
+    }
+    let hooks = dir.join(".git").join("hooks");
+    if hooks.is_dir() {
+        cmd.arg("-c").arg(format!("core.hooksPath={}", hooks.display()));
+    }
+    cmd.arg("--no-pager");
+    cmd.stdin(Stdio::null());
+    cmd
+}
+
+/// Refuse anything that reaches under a `.git/` directory, at any depth: the
+/// tree reader already skips dot-dirs, and `file_at(rev=WORKTREE)` reads
+/// straight off disk, so without this `.git/config` (which routinely embeds
+/// credentials in remote URLs) would be readable through the same API the
+/// Repo tab uses. Nested repos and submodules get the same treatment.
 pub fn validate_repo_rel(rel: &str) -> Result<()> {
     if rel.is_empty() {
         bail!("empty path");
@@ -84,6 +123,9 @@ pub fn validate_repo_rel(rel: &str) -> Result<()> {
             .any(|c| !matches!(c, Component::Normal(_)))
     {
         bail!("path must be relative and stay inside the project");
+    }
+    if rel_path.components().any(|c| matches!(c, Component::Normal(n) if n == ".git")) {
+        bail!("path must not reach inside .git");
     }
     Ok(())
 }
@@ -143,11 +185,8 @@ fn validate_rev(rev: &str) -> Result<()> {
 }
 
 fn git_output(dir: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    let mut child = git_cmd(dir)
         .args(args)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -521,7 +560,9 @@ pub fn commit_detail(dir: &Path, id: &str) -> Result<GitCommitDetail> {
     };
     let parents: Vec<String> = commit.parent_ids().map(|p| p.to_string()).collect();
 
-    let name_status = git_output(dir, &["show", "--format=", "--name-status", "--", &full], READ_TIMEOUT)?;
+    // No `--` before the revision: it would make the sha a pathspec and `git
+    // show` would report no files at all (this is exactly the bug it once was).
+    let name_status = git_output(dir, &["show", "--format=", "--name-status", &full], READ_TIMEOUT)?;
     let mut files = Vec::new();
     for line in String::from_utf8_lossy(&name_status.stdout).lines() {
         let mut parts = line.split('\t');
@@ -625,8 +666,7 @@ pub fn tree(dir: &Path, rev: Option<&str>, path: Option<&str>) -> Result<Vec<Git
         } else {
             GitTreeKind::File
         };
-        let size = None;
-        entries.push(GitTreeEntry { path: format!("{prefix}{name}"), kind, size });
+        entries.push(GitTreeEntry { path: format!("{prefix}{name}"), kind });
     }
     entries.sort_by(|a, b| match (a.kind, b.kind) {
         (GitTreeKind::Dir, GitTreeKind::File) => std::cmp::Ordering::Less,
@@ -802,6 +842,88 @@ mod tests {
         assert!(validate_repo_rel(":!target").is_err());
         assert!(validate_repo_rel("src/*.rs").is_err());
         assert!(validate_repo_rel("-A").is_err());
+    }
+
+    #[test]
+    fn refuses_git_internals() {
+        // The tree reader skips dot-dirs, so `.git/config` must be unreachable
+        // through the file API too — remote URLs often carry credentials.
+        assert!(validate_repo_rel(".git/config").is_err());
+        assert!(validate_repo_rel(".git").is_err());
+        assert!(validate_repo_rel("sub/.git/config").is_err());
+        // A file merely *named* .git-ish is fine.
+        assert!(validate_repo_rel("src/git.rs").is_ok());
+        assert!(validate_repo_rel(".github/workflows/ci.yml").is_ok());
+    }
+
+    /// The regression test for the untrusted-repo-config vector: a poisoned
+    /// `core.fsmonitor` in `.git/config` used to turn a routine `git status`
+    /// into arbitrary code execution. `git_cmd` must neutralize it.
+    #[test]
+    fn poisoned_fsmonitor_never_executes() {
+        let dir = std::env::temp_dir().join(format!("pf-fsmon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = || {
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["init", "-q"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !run() {
+            eprintln!("git unavailable — skipping");
+            return;
+        }
+        let sentinel = dir.join("PWNED");
+        let cfg = dir.join(".git").join("config");
+        let mut raw = std::fs::read_to_string(&cfg).unwrap();
+        raw.push_str(&format!(
+            "\n[core]\n\tfsmonitor = sh -c 'touch {}'\n",
+            sentinel.display()
+        ));
+        std::fs::write(&cfg, raw).unwrap();
+
+        let out = git_output(&dir, &["status", "--porcelain=v2"], Duration::from_secs(15));
+        assert!(out.is_ok(), "status failed: {out:?}");
+        assert!(!sentinel.exists(), "core.fsmonitor executed — hardening is bypassed");
+
+        // And the same through the public entry point the Repo tab uses.
+        let status = status(&dir, false).expect("status()");
+        assert!(!sentinel.exists(), "status() executed the fsmonitor hook");
+        assert!(status.branch.is_some(), "a real repo reports a branch: {status:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_cmd_carries_the_hardening_overrides() {
+        let cmd = git_cmd(Path::new("/tmp"));
+        let argv: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(argv.iter().any(|a| a == "core.fsmonitor="), "{argv:?}");
+        assert!(argv.iter().any(|a| a == "core.sshCommand=ssh"), "{argv:?}");
+        assert!(argv.iter().any(|a| a == "credential.helper="), "{argv:?}");
+        assert!(argv.iter().any(|a| a == "core.attributesFile="), "{argv:?}");
+    }
+
+    #[test]
+    fn rejects_dangling_symlink_writes() {
+        let dir = std::env::temp_dir().join(format!("pf-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("escaped.md"), dir.join("note.md")).unwrap();
+        assert!(crate::docs::write_doc(&dir, "note.md", "# hi").is_err());
+        assert!(!outside.join("escaped.md").exists(), "write escaped the project root");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
