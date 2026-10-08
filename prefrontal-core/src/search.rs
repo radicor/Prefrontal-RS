@@ -380,3 +380,70 @@ fn truncate(s: &str) -> String {
         format!("{cut}…")
     }
 }
+
+#[cfg(test)]
+impl SearchIndex {
+    /// Reproduces the failure mode M11 is about: a panic while the writer lock
+    /// is held leaves the mutex poisoned. Test-only — this never exists in a
+    /// production build.
+    pub fn poison_for_test(&self) {
+        let _guard = self.state.lock();
+        panic!("simulated tantivy panic under the writer lock");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pf-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// M11: a poisoned writer used to be fatal — every later reindex panicked
+    /// on `.expect("index writer poisoned")` and search silently froze with no
+    /// signal anywhere. Recovery must return `Err`/repair, never a second
+    /// panic, and the index must be usable afterwards.
+    #[test]
+    fn poisoned_writer_is_repaired_not_fatal() {
+        let index_dir = scratch("idx");
+        let project = scratch("proj");
+        std::fs::write(project.join("readme.md"), "some distinctive text to find").unwrap();
+
+        let idx = open(&index_dir).expect("open index");
+        assert_eq!(idx.reindex_project("alpha", &project).unwrap(), 1);
+        assert!(idx.is_healthy(), "a fresh index is healthy");
+
+        // Panic under the lock: the mutex is now poisoned.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.poison_for_test()
+        }));
+        assert!(panicked.is_err(), "the poison helper must panic");
+
+        // The very next reindex must repair it — no second panic, no Err that
+        // leaves a permanently poisoned slot behind.
+        let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.reindex_project("alpha", &project)
+        }));
+        assert!(recovered.is_ok(), "reindex must not panic again: {recovered:?}");
+        assert!(recovered.unwrap().is_ok(), "reindex must repair, not error out");
+        assert!(!idx.is_healthy(), "a repaired index is empty until it is refilled");
+
+        // Refilling is what the daemon does when `is_healthy()` goes false.
+        assert_eq!(idx.reindex_project("alpha", &project).unwrap(), 1);
+        idx.mark_healthy();
+        assert!(idx.is_healthy());
+
+        // …and querying works over the recovered writer.
+        let mut dirs = HashMap::new();
+        dirs.insert("alpha".to_string(), project.clone());
+        let hits = idx.search_hits("distinctive", 5, &dirs).expect("query after recovery");
+        assert!(!hits.is_empty(), "the refilled index must be searchable");
+
+        let _ = std::fs::remove_dir_all(&index_dir);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+}

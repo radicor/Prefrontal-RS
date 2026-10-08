@@ -46,11 +46,13 @@ impl Stats {
     pub fn failed(&self) -> u64 {
         self.failed.load(std::sync::atomic::Ordering::Relaxed)
     }
-    fn record(&self, ok: bool) {
+    fn record(&self, dir: &Path, ok: bool) {
         let counter = if ok { &self.watched } else { &self.failed };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !ok {
-            warn!("watch() failed — this directory will not update live");
+            // Without the path a warning is just noise: the whole point is to
+            // tell someone *which* project stopped updating live.
+            warn!("watch failed on {} — it will not update live", dir.display());
         }
     }
 }
@@ -70,7 +72,7 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
     let roots = state.cfg.root_paths();
     for root in &roots {
         let result = watcher.watch(root, RecursiveMode::NonRecursive);
-        state.watcher.record(result.is_ok());
+        state.watcher.record(root, result.is_ok());
         result.with_context(|| format!("watching root {}", root.display()))?;
         let Ok(entries) = std::fs::read_dir(root) else { continue };
         for entry in entries.filter_map(|e| e.ok()) {
@@ -103,7 +105,7 @@ fn add_watches(w: &mut RecommendedWatcher, dir: &Path, depth: u32, stats: &Stats
     if depth > MAX_DEPTH {
         return;
     }
-    stats.record(w.watch(dir, RecursiveMode::NonRecursive).is_ok());
+    stats.record(dir, w.watch(dir, RecursiveMode::NonRecursive).is_ok());
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.filter_map(|e| e.ok()) {
         let Ok(ft) = entry.file_type() else { continue };
@@ -113,10 +115,10 @@ fn add_watches(w: &mut RecommendedWatcher, dir: &Path, depth: u32, stats: &Stats
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if name == ".git" {
-            stats.record(w.watch(&path, RecursiveMode::NonRecursive).is_ok());
+            stats.record(&path, w.watch(&path, RecursiveMode::NonRecursive).is_ok());
             let refs = path.join("refs");
             if refs.is_dir() {
-                stats.record(w.watch(&refs, RecursiveMode::Recursive).is_ok());
+                stats.record(&refs, w.watch(&refs, RecursiveMode::Recursive).is_ok());
             }
             continue;
         }

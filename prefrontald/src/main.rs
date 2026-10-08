@@ -136,22 +136,30 @@ async fn origin_guard(
     }
 
     let path = req.uri().path().to_string();
-    let origin = header_str(req.headers(), "origin");
+    // Both checks apply independently. Whichever browser header is present,
+    // the other must not contradict it: `Sec-Fetch-Site: none` must not let a
+    // foreign `Origin` through, and a matching `Sec-Fetch-Site` must not excuse
+    // an `Origin` that says the request came from somewhere else.
+    let origin_ok = match header_str(req.headers(), "origin").as_deref() {
+        Some(o) => same_origin(o, req.headers()),
+        None => true, // no Origin: CLI, MCP, curl
+    };
     let refused = if path == "/ws" {
         // Browsers do not enforce same-origin on a WebSocket handshake, so an
         // unchecked `/ws` hands any page the whole `Snapshot` — project paths,
         // branches, commit subjects, remote URLs with embedded credentials.
         // Non-browser clients send no `Origin` and stay welcome.
-        origin.as_deref().is_some_and(|o| !same_origin(o, req.headers()))
+        !origin_ok
     } else if matches!(req.method(), &Method::GET | &Method::HEAD | &Method::OPTIONS) {
         false
     } else {
-        match header_str(req.headers(), "sec-fetch-site").as_deref() {
+        let site_ok = match header_str(req.headers(), "sec-fetch-site").as_deref() {
             // Browsers always send this on a cross-origin request; a missing
             // header means a non-browser client (CLI, MCP, curl).
-            Some(site) => !ALLOWED_FETCH_SITES.contains(&site),
-            None => origin.as_deref().is_some_and(|o| !same_origin(o, req.headers())),
-        }
+            Some(site) => ALLOWED_FETCH_SITES.contains(&site),
+            None => true,
+        };
+        !site_ok || !origin_ok
     };
     if refused {
         warn!("refused cross-origin {} {path}", req.method());
@@ -432,6 +440,10 @@ async fn rescan(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Project>>
             report.last_scan_unix = now_unix;
             report.last_scan_failed = true;
             *state.last_scan.write().await = Some(report);
+            // The throttle window was consumed by a scan that produced
+            // nothing; hand it back so the next retry actually runs instead
+            // of answering 200 with the old state.
+            state.last_scan_unix.store(0, Ordering::Relaxed);
             return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("rescan failed: {e}")));
         }
     };
@@ -973,7 +985,18 @@ async fn raw_asset(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
 
-    let mime = match path.rsplit('.').next().map(|e| e.to_lowercase()).as_deref() {
+    let mut headers = raw_headers(&path);
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(mime_for_path(&path)),
+    );
+    Ok((headers, bytes).into_response())
+}
+
+/// The extension → mime table for `/raw`. Every arm is a literal, so the
+/// header value is provably static rather than `expect`-ed at request time.
+fn mime_for_path(path: &str) -> &'static str {
+    match path.rsplit('.').next().map(|e| e.to_lowercase()).as_deref() {
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
@@ -983,23 +1006,52 @@ async fn raw_asset(
         Some("bmp") => "image/bmp",
         Some("avif") => "image/avif",
         _ => "application/octet-stream",
-    };
-    let filename = path.rsplit('/').next().unwrap_or("asset");
+    }
+}
+
+/// `/raw` response headers: the sandbox policy, plus a
+/// `Content-Disposition: attachment` so a hostile SVG can never be rendered as
+/// a document at the dashboard origin (H1).
+///
+/// The filename is attacker-controlled — projects can be cloned from anywhere.
+/// `HeaderValue` rejects anything outside visible ASCII, so a name like
+/// `banner-é.png`, or one carrying a control byte, must never be able to panic
+/// the request path. The quoted parameter is rewritten to safe ASCII, the
+/// original survives verbatim via RFC 5987, and if that still fails the header
+/// is dropped rather than the request: the sandbox policy is what actually
+/// prevents execution.
+fn raw_headers(path: &str) -> HeaderMap {
+    let filename = path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("asset");
+    let safe: String = filename
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' => '_',
+            c if c.is_ascii() && !c.is_ascii_control() => c,
+            _ => '?',
+        })
+        .collect();
+    let encoded: String = filename
+        .bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
     let mut headers = HeaderMap::new();
-    headers.insert(axum::http::header::CONTENT_TYPE, mime.parse().expect("static mime"));
-    headers.insert(
-        axum::http::header::CONTENT_DISPOSITION,
-        axum::http::HeaderValue::from_str(&format!(
-            "attachment; filename=\"{}\"",
-            filename.replace(['"', '\\', '\r', '\n'], "_")
-        ))
-        .expect("sanitized filename"),
-    );
+    let disposition = format!("attachment; filename=\"{safe}\"; filename*=UTF-8''{encoded}");
+    match axum::http::HeaderValue::from_str(&disposition) {
+        Ok(value) => {
+            headers.insert(axum::http::header::CONTENT_DISPOSITION, value);
+        }
+        Err(_) => warn!("dropping Content-Disposition for {filename:?} — header value rejected"),
+    }
     headers.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
         axum::http::HeaderValue::from_static(RAW_CSP),
     );
-    Ok((headers, bytes).into_response())
+    headers
 }
 
 /// The handshake itself. The `Origin` check lives in `origin_guard` so it runs
@@ -1220,6 +1272,44 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
+    /// Regression for the gate gap: `Sec-Fetch-Site` presence must not excuse
+    /// a foreign `Origin`. Previously `none`/`same-origin` short-circuited the
+    /// `Origin` check entirely.
+    #[tokio::test]
+    async fn fetch_site_does_not_excuse_a_foreign_origin() {
+        for site in ["none", "same-origin", "same-site"] {
+            let res = app(test_state())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/git/alpha/push")
+                        .header(header::HOST, "127.0.0.1:7320")
+                        .header("sec-fetch-site", site)
+                        .header(header::ORIGIN, "http://evil.example")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "site={site}");
+        }
+        // …and a same-origin Site is still not enough to smuggle a bad Origin
+        // on the websocket either.
+        let res = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/ws")
+                    .header(header::HOST, "127.0.0.1:7320")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::ORIGIN, "http://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "ws with foreign origin");
+    }
+
     #[test]
     fn same_origin_requires_an_exact_authority() {
         let mut headers = HeaderMap::new();
@@ -1341,6 +1431,48 @@ mod tests {
     fn markdown_scripts_never_survive() {
         let html = render_markdown("<script>fetch('/api/doc/p/n.md',{method:'PUT'})</script>\n");
         assert!(!html.contains("script"), "{html}");
+    }
+
+    /// Regression: `HeaderValue::from_str` rejects anything outside visible
+    /// ASCII, so a hostile or merely internationalised filename used to panic
+    /// the request path (`main.rs:996`, reproduced live with `a%01b.png`).
+    /// No filename may be able to panic the handler, and the sandbox policy
+    /// must survive even when the disposition header cannot be built.
+    #[test]
+    fn hostile_asset_filenames_never_panic_header_construction() {
+        for path in [
+            "assets/normal.svg",
+            "assets/banner-é.png",
+            "assets/🎨.gif",
+            "assets/a\u{1}b.png",
+            "assets/t\u{9}ab.png",
+            "assets/injected\"; evil=x.svg",
+            "assets/back\\slash.png",
+            "assets/\u{7F}.png",
+            "",
+            "/",
+        ] {
+            let headers = raw_headers(path);
+            assert_eq!(
+                headers.get(axum::http::header::CONTENT_SECURITY_POLICY),
+                Some(&axum::http::HeaderValue::from_static(RAW_CSP)),
+                "sandbox policy must be present for {path:?}"
+            );
+        }
+        let h = raw_headers("assets/banner-é.png");
+        let disp = h
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .expect("disposition for a UTF-8 filename")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(disp.starts_with("attachment;"), "{disp}");
+        assert!(disp.contains(r#"filename="banner-?.png""#), "{disp}");
+        // the original bytes survive for the download name (RFC 5987)
+        assert!(disp.contains("filename*=UTF-8''banner-%C3%A9.png"), "{disp}");
+        assert_eq!(mime_for_path("assets/x.SVG"), "image/svg+xml");
+        assert_eq!(mime_for_path("assets/x.png"), "image/png");
+        assert_eq!(mime_for_path("assets/x.unknown"), "application/octet-stream");
     }
 }
 

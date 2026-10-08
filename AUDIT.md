@@ -354,3 +354,74 @@ thoroughly than the audit demanded. Nothing found is a blocker.
 Before tagging: fix the `.panel-actions` guard; decide whether the dark-mode badge
 contrast goes in this release; and get the live boundary test re-run outside this
 sandbox — that last one is the claim separating H1–H3 from "fixed on paper."
+
+---
+
+## Self-audit round — 2026-10-08
+
+A follow-up pass re-testing the paths that had previously been reasoned about rather
+than executed. It turned up four defects — two of them in the fixes above — all now
+corrected.
+
+### Defects found and fixed
+
+1. **`/raw` panicked on any non-ASCII filename** — High. `HeaderValue::from_str` rejects
+   bytes above `0x7E`, so `banner-é.png` or any control byte hit
+   `.expect("sanitized filename")` and killed the worker thread, dropping the connection.
+   The sanitiser had only stripped quotes, backslashes, CR and LF. Fixed at
+   `prefrontald/src/main.rs:1024-1048`: the disposition is now built with an RFC 5987
+   `filename*=UTF-8''` fallback, and a rejected header value logs a warning instead of
+   panicking. Regression test covers the reproduced vector (`a\u{1}b.png`), emoji, tab,
+   injected quotes and `0x7F`, and asserts the sandbox CSP survives even when the
+   disposition cannot be built.
+2. **`Sec-Fetch-Site` presence short-circuited the `Origin` check** — Medium, gate bypass.
+   `Some(site) => !ALLOWED_FETCH_SITES...` ignored `Origin` entirely, so
+   `Sec-Fetch-Site: none` plus `Origin: http://evil.example` was accepted. The two checks
+   now apply independently (`prefrontald/src/main.rs:146-159`). Test covers all three
+   site values with a foreign `Origin`, including the WebSocket handshake.
+3. **A failed rescan consumed the throttle window** — Medium, silent failure. The
+   `last_scan_unix` stamp was written before the scan ran, so a panic left a retry inside
+   the 5 s window returning `200` with stale state instead of running. Now rolled back to
+   `0` on the error path (`prefrontald/src/main.rs:446`).
+4. **`watch()` warnings named no directory** — Low. The fix for M12 logged
+   `watch() failed — this directory will not update live` with no path, which is
+   unactionable. The warning now carries the directory (`prefrontald/src/watch.rs`), with
+   all five call sites updated.
+
+### Verification gaps closed
+
+- **M11's recovery path had never executed.** A test now poisons the *real* mutex via a
+  test-only helper and proves the next reindex repairs rather than panicking, that the
+  index is searchable afterwards, and that health is restored on refill. The suspicion
+  that reopen would hit tantivy's `LockBusy` was wrong — disproved by execution rather
+  than argued.
+- **D2's test asserts the exact bypass vector**, including over `/ws`.
+
+### Coverage not claimed
+
+- **D3's rollback is code-verified, not test-verified.** `rescan_merges_and_is_throttled`
+  exercises only the success path; the panic branch at `main.rs:446` is never triggered.
+- **D4 has no test.** `prefrontald/src/watch.rs` contains zero tests, so nothing asserts
+  the warning names a directory.
+- **H5 remains code-verified only.** A scan panic could not be induced — the audit's own
+  suggested repro (a truncated packfile) degrades gracefully, and the only `.expect`s in
+  the scan path are static regex constructors that would fail for every project at once.
+  Same confidence level as before.
+
+### Corrections to the round summary
+
+- **`commit_detail` does not still return `files: []`.** That was fixed in the previous
+  commit (`prefrontal-core/src/git.rs:565`); the residual was stale and is struck.
+- **"All four now covered by tests" held for two of the four** (D1, D2). See above.
+- One fixture from an earlier panicked test run remained in `/tmp`; cleaned up.
+
+### Residuals accepted
+
+- **Host port is not compared** — `Host: localhost:9999` is accepted because
+  `request_host` strips the port. Browsers cannot forge `Host`, and mutations are still
+  gated on `Origin`/`Sec-Fetch-Site`, so this is defence-in-depth left permissive to
+  avoid silently breaking writes behind a TLS-terminating proxy.
+- **Two daemons sharing `~/.local/share/prefrontal/index`** makes the second one's search
+  degrade on the tantivy lock. Pre-existing, surfaced by the audit run, not introduced.
+
+Test count is now 26 (25 attributes plus the `prefrontal-client` doctest), up from 22.
