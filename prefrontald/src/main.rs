@@ -422,7 +422,7 @@ async fn rescan(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Project>>
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if now_unix.saturating_sub(last) < RESCAN_MIN_INTERVAL.as_secs() {
+    if rescan_throttled(last, now_unix) {
         return Ok(Json(state.projects.read().await.clone()));
     }
     state.last_scan_unix.store(now_unix, Ordering::Relaxed);
@@ -432,26 +432,14 @@ async fn rescan(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Project>>
     let started_unix = now_unix;
     let fresh = match tokio::task::spawn_blocking(move || scan_all(&cfg)).await {
         Ok(fresh) => fresh,
-        Err(e) => {
-            // A panicked scan used to become an empty Vec and wipe the
-            // dashboard for every open tab. Keep what we have and say so.
-            error!("rescan panicked ({e}) — keeping the previous project list");
-            let mut report = state.last_scan.read().await.clone().unwrap_or_default();
-            report.last_scan_unix = now_unix;
-            report.last_scan_failed = true;
-            *state.last_scan.write().await = Some(report);
-            // The throttle window was consumed by a scan that produced
-            // nothing; hand it back so the next retry actually runs instead
-            // of answering 200 with the old state.
-            state.last_scan_unix.store(0, Ordering::Relaxed);
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("rescan failed: {e}")));
-        }
+        Err(e) => return Err(note_scan_failure(&state, now_unix, &e.to_string()).await),
     };
 
     if state.scan_gen.load(Ordering::SeqCst) != gen {
         warn!("discarding a rescan that a newer one superseded");
         return Ok(Json(state.projects.read().await.clone()));
     }
+
     let merged = {
         let mut projects = state.projects.write().await;
         let merged = merge_scan(fresh, &projects, started_unix);
@@ -466,6 +454,28 @@ async fn rescan(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Project>>
     *state.last_scan.write().await = Some(report);
     let _ = state.tx.send(Event::Snapshot { projects: merged.clone() });
     Ok(Json(merged))
+}
+
+/// Is a rescan too soon after the last one? Extracted so the floor is
+/// testable on its own — `POST /api/rescan` is unauthenticated and a scan is a
+/// whole-filesystem walk.
+fn rescan_throttled(last: u64, now: u64) -> bool {
+    now.saturating_sub(last) < RESCAN_MIN_INTERVAL.as_secs()
+}
+
+/// Bookkeeping for a scan that panicked. A panicked scan used to become an
+/// empty `Vec` and wipe the dashboard for every open tab; now we keep the
+/// previous list, say so in `/api/health`, and **hand the throttle window
+/// back** so the user's immediate retry actually runs instead of quietly
+/// answering `200` with stale state.
+async fn note_scan_failure(state: &AppState, now_unix: u64, detail: &str) -> ApiError {
+    error!("rescan panicked ({detail}) — keeping the previous project list");
+    let mut report = state.last_scan.read().await.clone().unwrap_or_default();
+    report.last_scan_unix = now_unix;
+    report.last_scan_failed = true;
+    *state.last_scan.write().await = Some(report);
+    state.last_scan_unix.store(0, Ordering::Relaxed);
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("rescan failed: {detail}"))
 }
 
 /// Fold a full scan into the live list. The scan read the filesystem before
@@ -1376,6 +1386,52 @@ mod tests {
         );
         assert_eq!(state.scan_gen.load(Ordering::SeqCst), 1, "no second scan started");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C1: the rollback branch. A panicked scan must (a) keep the previous
+    /// project list, (b) mark the failure where `/api/health` can see it, and
+    /// (c) hand the throttle window back — otherwise the user's immediate
+    /// retry is silently answered with `200` and stale state, which is the
+    /// same "silent" failure the original H5 finding was about.
+    #[tokio::test]
+    async fn a_failed_scan_keeps_state_and_hands_back_the_throttle() {
+        let state = test_state();
+        state.projects.write().await.push(sample_project("/kept", 10));
+        let now = 1_000_000u64;
+
+        // The handler stamps the clock *before* scanning…
+        state.last_scan_unix.store(now, Ordering::Relaxed);
+        assert!(rescan_throttled(now, now), "a scan inside the window is throttled");
+
+        // …so the failure path has to give it back.
+        let (code, body) = note_scan_failure(&state, now, "task panicked").await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("task panicked"), "{body}");
+        assert_eq!(
+            state.projects.read().await.len(),
+            1,
+            "a failed scan must not blank the dashboard"
+        );
+        assert_eq!(state.last_scan_unix.load(Ordering::Relaxed), 0);
+        assert!(
+            !rescan_throttled(0, now),
+            "a retry immediately after a failure must be allowed to run"
+        );
+        let report = state.last_scan.read().await.clone().unwrap();
+        assert!(report.last_scan_failed, "the failure is visible in /api/health");
+    }
+
+    #[test]
+    fn the_rescan_floor_is_five_seconds() {
+        assert!(rescan_throttled(1_000, 1_000), "same second");
+        assert!(rescan_throttled(1_000, 1_004), "just inside the window");
+        assert!(!rescan_throttled(1_000, 1_005), "exactly at the floor");
+        assert!(!rescan_throttled(1_000, 9_999), "well past it");
+        // The failure rollback stores 0; that alone is still inside the floor at
+        // t=0, and only unblocks once real time has moved past it — which is
+        // the point of rolling back at all.
+        assert!(rescan_throttled(0, 0));
+        assert!(!rescan_throttled(0, RESCAN_MIN_INTERVAL.as_secs()));
     }
 
     fn sample_project(path: &str, touched: i64) -> Project {

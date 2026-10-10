@@ -32,9 +32,13 @@
   --lang-python:     #3987e5;
   --lang-godot:      #9085e9;
 
-  /* badge text: near-white on the saturated fills in dark mode, dark ink in
-     light mode where near-white was down to 1.73:1 */
-  --badge-ink:       #ffffff;
+  /* Badge text sits on saturated status fills, not on the page. Measured:
+     white ink is 1.83:1 on warning, 2.64:1 on serious and 3.35:1 on good —
+     all below the 4.5:1 bar for 11.5px bold. Dark ink passes all three
+     (10.7 / 7.5 / 5.9), so it is the default in *both* themes;
+     `.badge.critical` is the one fill dark ink cannot carry (4.10:1) and
+     keeps white text at 4.80:1. */
+  --badge-ink:       #0b0b0b;
 }
 
 @media (prefers-color-scheme: light) {
@@ -68,8 +72,7 @@
     --critical-text: #a82424;
     --good-text:     #14650f;
   }
-  /* the critical fill is dark enough that dark ink on it still fails (4.1:1) */
-  .badge.critical { color: #ffffff; }
+  /* (the critical badge keeps white ink in both themes — see the .badge rules) */
   .git-line .dirty,
   .panel-status .warn,
   .repo-row .mark.unstaged { color: var(--warning-text); }
@@ -382,7 +385,7 @@ body {
 }
 .badge.warning  { background: var(--st-warning); }
 .badge.serious  { background: var(--st-serious); }
-.badge.critical { background: var(--st-critical); }
+.badge.critical { background: var(--st-critical); color: #ffffff; }
 
 .git-line { color: var(--muted); font-size: 12px; display: flex; gap: 10px; }
 .git-line .branch { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
@@ -508,7 +511,10 @@ body {
 
 .panel-foot { border-top: 1px solid var(--hairline); background: var(--surface); }
 .repo-body[hidden], #notes-body[hidden], #repo-commit-bar[hidden],
-#repo-tree[hidden], #repo-banner[hidden] { display: none; }
+#repo-tree[hidden], #repo-banner[hidden], #notes-actions[hidden] { display: none; }
+/* `.panel-actions` is a flex row, and an author `display` beats the `hidden`
+   attribute — without this guard, `hidden` on it is inert and the next
+   button added there shows up on the wrong tab. */
 
 .repo-body { display: flex; flex: 1; min-height: 0; }
 .repo-side {

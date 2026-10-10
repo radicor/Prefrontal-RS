@@ -5768,6 +5768,7 @@ dependencies = [
  "axum",
  "comrak",
  "notify",
+ "parking_lot",
  "prefrontal-core",
  "prefrontal-protocol",
  "serde",

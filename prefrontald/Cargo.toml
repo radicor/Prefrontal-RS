@@ -22,3 +22,4 @@ ammonia = "4.1.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+parking_lot = "0.12"

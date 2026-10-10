@@ -251,3 +251,118 @@ async fn rescan_one(state: &Arc<AppState>, dir: PathBuf) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pf-watch-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The counters behind `GET /api/health`: a `watch()` that fails must be
+    /// counted, not swallowed, or a project silently stops updating while the
+    /// dashboard still claims to be live.
+    #[test]
+    fn counts_successes_and_failures_separately() {
+        let s = Stats::default();
+        assert_eq!((s.watched(), s.failed()), (0, 0));
+        s.record(Path::new("/ok/one"), true);
+        s.record(Path::new("/ok/two"), true);
+        assert_eq!((s.watched(), s.failed()), (2, 0));
+        s.record(Path::new("/nope"), false);
+        assert_eq!((s.watched(), s.failed()), (2, 1), "a failure must not count as watched");
+    }
+
+    /// The fix this round added: the warning has to name the directory, or it
+    /// is unactionable noise. Captured through a real subscriber so the
+    /// assertion is on the formatted line an operator actually sees, not on a
+    /// re-implementation of the message.
+    #[test]
+    fn failure_warning_names_the_directory_and_successes_stay_quiet() {
+        let dir = scratch("named");
+        let captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let stats = Stats::default();
+
+        tracing::subscriber::with_default(
+            tracing_subscriber::fmt()
+                .with_writer(Sink(captured.clone()))
+                .with_ansi(false)
+                .finish(),
+            || {
+                stats.record(&dir, false);
+                stats.record(Path::new("/fine"), true);
+            },
+        );
+
+        let log = String::from_utf8(captured.lock().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "only failures should log, got: {log:?}");
+        assert!(
+            lines[0].contains(&dir.display().to_string()),
+            "the warning must name the directory, got: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Routes the formatter's output into a shared buffer.
+    struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Self::Writer {
+            Sink(self.0.clone())
+        }
+    }
+
+    /// `add_watches` must count a real directory it watched, and must survive
+    /// a directory that does not exist (which is what a create/delete race
+    /// hands it).
+    #[test]
+    fn add_watches_counts_a_real_directory_and_tolerates_a_vanished_one() {
+        let dir = scratch("real");
+        let stats = Stats::default();
+        let mut watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {})
+            .expect("create watcher");
+        add_watches(&mut watcher, &dir, 0, &stats);
+        assert_eq!(stats.watched(), 1, "the scratch dir should be watched");
+        assert_eq!(stats.failed(), 0);
+
+        let gone = dir.join("vanished");
+        add_watches(&mut watcher, &gone, 0, &stats);
+        assert_eq!(stats.failed(), 1, "a vanished path is a watch failure, not a crash");
+        assert_eq!(stats.watched(), 1, "and must not be counted as watched");
+
+        // Depth guard: beyond MAX_DEPTH we stop rather than recursing forever.
+        let before = (stats.watched(), stats.failed());
+        add_watches(&mut watcher, &dir, MAX_DEPTH + 1, &stats);
+        assert_eq!((stats.watched(), stats.failed()), before, "MAX_DEPTH stops the walk");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `project_of` maps an event path to the project directory it lives in —
+    /// the root of every debounced rescan. A wrong answer silently rescans the
+    /// wrong thing.
+    #[test]
+    fn maps_events_to_their_project_directory() {
+        let roots = vec![PathBuf::from("/srv/Projects")];
+        let p = project_of(Path::new("/srv/Projects/alpha/src/lib.rs"), &roots);
+        assert_eq!(p, Some(PathBuf::from("/srv/Projects/alpha")));
+        assert_eq!(project_of(Path::new("/srv/Projects"), &roots), None);
+        assert_eq!(project_of(Path::new("/elsewhere/alpha"), &roots), None);
+    }
+}
